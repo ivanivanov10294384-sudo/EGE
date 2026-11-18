@@ -1,0 +1,612 @@
+"""Клиент Kimi API (Moonshot AI) — OpenAI-совместимый Chat Completions.
+
+Подключение — переменными окружения (см. .env.example):
+  KIMI_API_KEY    — ключ с https://platform.kimi.ai/ (без него ассистент отвечает заглушкой)
+  KIMI_BASE_URL   — по умолчанию https://api.moonshot.ai/v1; для Китая — https://api.moonshot.cn/v1
+  KIMI_MODEL      — «слабая» модель быстрых ответов, по умолчанию kimi-k2.6
+  KIMI_MODEL_FAST — альтернативное имя слабой модели (резерв), по умолчанию kimi-k2.6
+  KIMI_MODEL_DEEP — сильная модель «глубокого изучения», по умолчанию kimi-k3
+  KIMI_EFFORT     — режим размышления kimi-k3: low / high / max (по умолчанию max)
+  KIMI_MAX_TOKENS / KIMI_MAX_TOKENS_DEEP — ЯВНЫЙ лимит генерации (см. ниже). По умолчанию пусто.
+  KIMI_MAX_TOKENS_CEILING — «бесконечный» бюджет, по умолчанию 100 000 000
+  KIMI_THINK_EXTRA — надбавка к бюджету на размышления, по умолчанию 0
+  KIMI_TIMEOUT    — потолок времени обычного запроса, по умолчанию 600 с
+  KIMI_TIMEOUT_DEEP — потолок «глубокого» запроса, по умолчанию 3600 с
+  KIMI_SOCK_READ  — сколько секунд ТИШИНЫ в потоке считать обрывом, по умолчанию 300
+  KIMI_CONNECT    — таймаут установки соединения, по умолчанию 30
+  KIMI_TOOL_ROUNDS — сколько заходов tool_calls (web_search/fetch, см. webtools.py) на один ответ, по умолчанию 6
+
+ВАЖНО ПРО ЛИМИТ ТОКЕНОВ (это и была причина «ИИ сейчас не отвечает»):
+  `max_tokens` у Kimi ограничивает СУММУ `reasoning_content` + `content`
+  (https://platform.kimi.ai/docs/guide/use-thinking-models). Если поле НЕ передать,
+  сервер применит свой небольшой дефолт, и у kimi-k3 с reasoning_effort=max он целиком
+  сгорает на размышлениях → контент пустой → пользователь видит «ИИ сейчас не отвечает».
+  Поэтому поле передаётся ВСЕГДА и всегда с огромным бюджетом: по умолчанию 100 000 000.
+  Если конкретный деплой API откажет в таком числе (у каждой модели свой потолок вывода),
+  клиент сам подберёт МАКСИМУМ, который этот API принимает, и запомнит его — лимит с
+  нашей стороны никогда не режет ответ.
+
+ВАЖНО ПРО ОБРЕЗАННЫЙ ОТВЕТ (корень бага «в Word попало не всё»):
+  Обрезанный ответ НИКОГДА не выдаётся за полный. Раньше частичный текст (поток оборвался:
+  finish_reason=length — кончился бюджет, обрыв соединения) молча отдавался за готовый ответ,
+  и файл собирался из обрывка — вопросы теста в документе были, а ответы в конце — нет.
+  Теперь ответ ДОСОБИРАЕТСЯ продолжением (до MAX_CONT заходов): обрезанный текст
+  закрепляется репликой ассистента и модель продолжает ровно с места обрыва (CONT_PROMPT).
+  В ответы и файлы попадает всё, что API выдал целиком.
+
+Важно: Kimi принимает текст, картинки и видео — ГОЛОС НЕ РАСПОЗНАЁТ (audio-входа нет):
+распознаванием речи занимается отдельный STT (см. whisper.py).
+
+Просьба «не падать» выполнена буквально: любая ошибка (нет ключа, сеть, таймаут,
+неожиданный формат ответа) — это None из ask() и запись в лог, а не исключение наверх.
+"""
+import json, logging, os, re, time
+
+import aiohttp
+
+log = logging.getLogger("tutor.kimi")
+
+BASE = (os.getenv("KIMI_BASE_URL", "").strip() or "https://api.moonshot.ai/v1").rstrip("/")  # пустое значение = дефолт
+API_KEY = os.getenv("KIMI_API_KEY", "").strip()
+MODEL = (os.getenv("KIMI_MODEL", "") or "kimi-k2.6").strip()
+FAST_MODEL = (os.getenv("KIMI_MODEL_FAST", "") or "kimi-k2.6").strip()
+DEEP_MODEL = (os.getenv("KIMI_MODEL_DEEP", "") or "kimi-k3").strip()
+EFFORT = (os.getenv("KIMI_EFFORT", "") or "max").strip()
+if EFFORT not in ("low", "high", "max"): EFFORT = "max"
+
+
+def _int(name, default, lo, hi):
+    try: v = int(os.getenv(name, "") or default)
+    except ValueError: v = default
+    return max(lo, min(hi, v))
+
+def _flt(name, default, lo, hi):
+    try: v = float(os.getenv(name, "") or default)
+    except ValueError: v = default
+    return max(lo, min(hi, v))
+
+def _opt_int(name):
+    v = os.getenv(name, "").strip()
+    try:
+        return int(v) if v else None
+    except ValueError:
+        return None
+
+# Бюджет генерации. ПО УМОЛЧАНИЮ ОГРАНИЧЕНИЙ НЕТ: max_tokens выставляется в «бесконечный»
+# потолок (100 000 000), а не пропускается — пропуск поля включает серверный дефолт,
+# который сгорает на размышлениях. Явно ограничить можно только через env.
+CEILING_DEFAULT = 100_000_000
+MAX_TOKENS_CEILING = _opt_int("KIMI_MAX_TOKENS_CEILING") or CEILING_DEFAULT
+MAX_TOKENS = _opt_int("KIMI_MAX_TOKENS")          # явный лимит обычного ответа (пусто = без лимита)
+MAX_TOKENS_DEEP = _opt_int("KIMI_MAX_TOKENS_DEEP")  # явный лимит «глубокого» ответа (пусто = без лимита)
+THINK_EXTRA = _opt_int("KIMI_THINK_EXTRA") or 0
+TIMEOUT = _flt("KIMI_TIMEOUT", 600, 3, 7200)
+TIMEOUT_DEEP = _flt("KIMI_TIMEOUT_DEEP", 3600, 3, 21600)
+SOCK_READ = _flt("KIMI_SOCK_READ", 300, 5, 3600)
+CONNECT = _flt("KIMI_CONNECT", 30, 3, 300)
+
+# Продолжение обрезанного ответа: сколько заходов допускается и как просим продолжать.
+MAX_CONT = _int("KIMI_MAX_CONT", 3, 1, 10)
+# Сколько заходов tool_calls (web_search/fetch) допускается на один ответ чата (см. webtools.py).
+MAX_TOOL_ROUNDS = _int("KIMI_TOOL_ROUNDS", 6, 1, 10)
+# Когда заходы исчерпаны: инструменты убираются, модель досказывает финал по полученным данным.
+TOOL_FINAL_PROMPT = ("Инструменты поиска больше недоступны. Дай пользователю финальный ответ по уже "
+                     "полученным данным; не выдумывай фактов и ссылок. Чего не хватило — одной "
+                     "строкой в конце ответа.")
+CONT_PROMPT = ("Продолжай ответ ровно с места, где он оборвался: без повторов уже "
+               "написанного, без вступлений и пояснений — сразу продолжение текста.")
+
+
+def stream_timeout():
+    """Таймаут для СТРИМА. Общего потолка времени НЕТ умышленно: размышление kimi-k3
+    (reasoning_effort=max) легко идёт 5–10 минут, и любой общий таймаут просто убивает
+    соединение на середине — пользователь видит «Вишенка думает…» и затем «ИИ сейчас
+    не отвечает». Это и была вторая причина обрыва. Обрыв связи ловится иначе — по
+    тишине в потоке (sock_read): если данные вообще не приходят, запрос не виснет вечно."""
+    return aiohttp.ClientTimeout(total=None, sock_connect=CONNECT, sock_read=SOCK_READ)
+
+
+def request_timeout(total):
+    """Таймаут для НЕстримового запроса: тут общий потолок уместен (ответ приходит целиком)."""
+    return aiohttp.ClientTimeout(total=total, sock_connect=CONNECT, sock_read=SOCK_READ)
+
+# Потолок max_tokens, который принимает конкретный API/модель. Запоминается после первого
+# успешного запроса, чтобы не дёргать сервер лишними 400 на каждом вызове.
+_ACCEPTED = {}
+# Лестница подбора, если API отверг бюджет и в ошибке нет явного максимума.
+_LADDER = (CEILING_DEFAULT, 16_777_216, 4_194_304, 1_048_576, 262_144,
+           131_072, 65_536, 32_768, 16_384, 8_192, 4_096)
+_NUM_RE = re.compile(r"\d[\d_ ]*\d|\d")
+
+
+def enabled():
+    """Есть ли ключ API. Без него ассистент работает заглушкой и наружу не ходит."""
+    return bool(API_KEY)
+
+
+def resolve_model(model=None, deep=False):
+    """Какая модель будет использована СТРОГО: явно переданная, иначе выбранная режимом.
+    Никаких подмен и аварийных откатов на другую модель здесь и ниже нет."""
+    return (model or (DEEP_MODEL if deep else MODEL)).strip()
+
+
+def budget_for(deep=False, reasoning=False, override=None):
+    """Бюджет max_tokens для запроса. Всегда > 0: поле уходит в запрос ОБЯЗАТЕЛЬНО.
+
+    • override — явный бюджет (повтор запроса после отказа API);
+    • иначе KIMI_MAX_TOKENS[_DEEP], если заданы в окружении;
+    • иначе «бесконечный» потолок (по умолчанию 100 000 000)."""
+    if override is not None and override > 0:
+        return int(override)
+    base = (MAX_TOKENS_DEEP if deep else MAX_TOKENS) or MAX_TOKENS_CEILING
+    return int(base) + (THINK_EXTRA if reasoning else 0)
+
+
+def _cap_key(model):
+    return "%s|%s" % (BASE, model)
+
+
+def _clamp_to_known(model, budget):
+    acc = _ACCEPTED.get(_cap_key(model))
+    return min(budget, acc) if acc else budget
+
+
+def _remember(model, budget):
+    if budget and budget > _ACCEPTED.get(_cap_key(model), 0):
+        _ACCEPTED[_cap_key(model)] = budget
+
+
+def _cap_from_error(text, want):
+    """Максимум max_tokens, который API сам объявил в ошибке («… must be <= 65536»)."""
+    best = None
+    for raw in _NUM_RE.findall(text or ""):
+        try:
+            n = int(raw.replace("_", "").replace(" ", ""))
+        except ValueError:
+            continue
+        if 4096 <= n < want and (best is None or n > best):
+            best = n
+    return best
+
+
+def _smaller_budget(model, budget, err_text=""):
+    """Следующий (меньший) бюджет после отказа API, либо None — дальше снижать некуда."""
+    cap = _cap_from_error(err_text, budget)
+    if cap:
+        _ACCEPTED[_cap_key(model)] = cap
+        return cap
+    for n in _LADDER:
+        if n < budget:
+            _ACCEPTED[_cap_key(model)] = n
+            return n
+    return None
+
+
+def build_payload(messages, model=None, deep=False, json_mode=False, images=None, thinking=False,
+                  max_tokens=None, tools=None):
+    """Тело запроса /chat/completions.
+
+    • temperature/top_p не передаём: у K2.x и K3 они фиксированы, API отвечает ошибкой
+      на любые другие значения.
+    • Модель выбирается СТРОГО по режиму: deep → KIMI_MODEL_DEEP, иначе KIMI_MODEL.
+    • thinking — параметр только семейства K2.x; строго следует выбранному режиму:
+      быстрый ответ — размышления выключены, глубокий — включены. У K3 размышление
+      всегда включено и управляется reasoning_effort (режим K3), поле thinking K3 не принимает.
+    • json_mode — ответ строго в JSON (response_format json_object): используется для разбора задач.
+    • images — список base64/jpeg|png|webp: подмешиваются в последнее сообщение (vision);
+      к сообщениям role=tool/assistant не подмешиваются — только к реплике пользователя.
+    • tools — декларации официальных инструментов (webtools.declarations): модель сама решает,
+      когда искать в интернете; исполнение tool_calls — в _ask_stream через tool_exec."""
+    m = resolve_model(model, deep)
+    content = messages[-1]["content"]
+    if images and messages[-1].get("role") == "user":
+        parts = [{"type": "text", "text": content if isinstance(content, str) else ""}]
+        for i in images:
+            parts.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + i}})
+        content = parts
+    msgs = list(messages[:-1]) + [{**messages[-1], "content": content}]
+    reasoning = bool(thinking) or m.startswith("kimi-k3")
+    budget = budget_for(deep, reasoning, max_tokens)
+    if max_tokens is None:                       # явный бюджет (повтор после отказа) не трогаем
+        budget = _clamp_to_known(m, budget)
+    p = {"model": m, "messages": msgs,
+         # Лимит передаётся ВСЕГДА: без поля сервер ставит свой маленький дефолт,
+         # и K3 тратит его целиком на размышления (контент остаётся пустым).
+         "max_tokens": budget}
+    if m.startswith("kimi-k2.6"):
+        p["thinking"] = {"type": "enabled" if thinking else "disabled"}
+    if m.startswith("kimi-k3"):
+        p["reasoning_effort"] = EFFORT
+    if json_mode:
+        p["response_format"] = {"type": "json_object"}
+    if tools:
+        p["tools"] = tools
+    return p
+
+
+def _tc_add(tc_acc, tcs):
+    """Дельта tool_calls из стрима → накопитель по index (id/имя/аргументы приходят кусками)."""
+    for tc in tcs:
+        if not isinstance(tc, dict):
+            continue
+        slot = tc_acc.setdefault(tc.get("index") or 0, {"id": "", "name": "", "args": []})
+        if tc.get("id"):
+            slot["id"] = tc["id"]
+        fn = tc.get("function") or {}
+        if fn.get("name"):
+            slot["name"] = fn["name"]
+        if fn.get("arguments"):
+            slot["args"].append(fn["arguments"])
+
+
+def _tc_list(tc_acc):
+    """Накопитель → готовые tool_calls для истории (формат OpenAI) или пустой список."""
+    out = []
+    for i in sorted(tc_acc):
+        s = tc_acc[i]
+        if not s["name"]:
+            continue
+        out.append({"id": s["id"] or "call_%s" % i, "type": "function",
+                    "function": {"name": s["name"], "arguments": "".join(s["args"])}})
+    return out
+
+
+async def _tool_results(calls, tool_exec):
+    """Исполнить tool_calls модели → сообщения role=tool для истории. Сбой — строкой, не исключением."""
+    out = []
+    for c in calls:
+        name, args = c["function"]["name"], c["function"]["arguments"]
+        try:
+            res = await tool_exec(name, args)
+        except Exception as e:
+            log.warning("kimi: инструмент %s не выполнился: %r", name, e)
+            res = "Инструмент недоступен — ответь без него."
+        out.append({"role": "tool", "tool_call_id": c["id"], "content": str(res)[:20000]})
+    return out
+
+
+def _continue_run(run, acc):
+    """Диалог для захода продолжения: обрезанный ответ закрепляется репликой ассистента,
+    и модель продолжает ровно с места обрыва (CONT_PROMPT). Модель и режим не меняются."""
+    return run + [{"role": "assistant", "content": acc}, {"role": "user", "content": CONT_PROMPT}]
+
+
+async def ask(messages, model=None, deep=False, json_mode=False, images=None, max_tokens=None, _attempt=0):
+    """Ответ модели (str) или None — нет ключа / API недоступен / формат ответа неожиданный.
+
+    Обрезанный ответ (finish_reason=length) не возвращается как готовый — он дособирается
+    продолжением (до MAX_CONT заходов), чтобы в ответ попало всё, что API выдал целиком."""
+    if not API_KEY:
+        return None
+    m = resolve_model(model, deep)
+    budget = budget_for(deep, m.startswith("kimi-k3"), max_tokens)
+    if max_tokens is None:
+        budget = _clamp_to_known(m, budget)
+    run, acc, cont = list(messages), [], 0    # run — диалог с закреплёнными продолжениями
+    t0 = time.monotonic()
+    attempt, drops = 0, 0
+    while True:
+        body = build_payload(run, model=m, deep=deep, json_mode=json_mode, images=images,
+                             max_tokens=budget)
+        timeout = TIMEOUT_DEEP if deep else TIMEOUT
+        try:
+            async with aiohttp.ClientSession(timeout=request_timeout(timeout)) as s:
+                async with s.post(BASE + "/chat/completions", json=body,
+                                  headers={"Authorization": "Bearer " + API_KEY}) as r:
+                    raw = await r.text()
+                    if r.status != 200:
+                        log.warning("kimi: HTTP %s: %s", r.status, raw[:300])
+                        if r.status == 400 and "max_tokens" in raw:
+                            nb = _smaller_budget(m, budget, raw)
+                            if nb is not None and drops < 6:   # защита от бесконечного пересогласования
+                                drops += 1
+                                budget = nb
+                                continue          # повтор с бюджетом, который API примет
+                        return None
+        except Exception as e:                    # сеть, таймаут — всё мимо бота
+            log.warning("kimi: запрос не прошёл: %r", e)
+            return None
+        try:
+            j = json.loads(raw)
+        except ValueError:
+            log.warning("kimi: не JSON в ответе: %s", raw[:300])
+            return None
+        ch = (j.get("choices") or [{}])[0]
+        reply = (ch.get("message") or {}).get("content")
+        fr = ch.get("finish_reason")
+        if isinstance(reply, str) and reply.strip():
+            acc.append(reply)
+            _remember(m, budget)
+            if fr == "length" and cont < MAX_CONT:    # обрезанный по бюджету ответ — дособираем
+                log.warning("kimi: ответ обрезан по max_tokens — продолжаю (заход %s)", cont + 1)
+                run = _continue_run(run, "".join(acc))
+                cont += 1
+                continue
+            if fr == "length":
+                log.warning("kimi: ответ обрезан и продолжения исчерпаны — отдаю как есть (%s символов)",
+                            sum(len(x) for x in acc))
+            log.info("kimi: ask model=%s max_tokens=%s dt=%.1fs finish=%s cont=%d tokens %s", m,
+                     body.get("max_tokens"), time.monotonic() - t0, fr, cont, _usage_str(j.get("usage")))
+            return "".join(acc).strip()
+        if acc:                           # продолжение не дало текста — отдаём, что уже собрали
+            log.warning("kimi: продолжение пустое (finish=%s) — отдаю %s символов как есть",
+                        fr, sum(len(x) for x in acc))
+            return "".join(acc).strip()
+        # бюджет сгорел на размышлениях (finish_reason=length) — повторяем с тем же
+        # огромным бюджетом: модель почти всегда доходит до ответа со второго раза
+        log.warning("kimi: пустой ответ (finish=%s usage=%s max_tokens=%s)",
+                    fr, j.get("usage"), body.get("max_tokens"))
+        if attempt == 0:
+            attempt += 1
+            continue
+        return None
+
+
+def _usage_pick(u):
+    """usage одного ответа → (вход, выход, мышление, из кэша); недостающее — None."""
+    if not isinstance(u, dict):
+        return None, None, None, None
+    det = u.get("completion_tokens_details") if isinstance(u.get("completion_tokens_details"), dict) else {}
+    pdet = u.get("prompt_tokens_details") if isinstance(u.get("prompt_tokens_details"), dict) else {}
+    cached = u.get("cached_tokens")
+    return (u.get("prompt_tokens"), u.get("completion_tokens"), det.get("reasoning_tokens"),
+            cached if cached is not None else pdet.get("cached_tokens"))
+
+
+def _usage_str(u):
+    a, b, c, d = _usage_pick(u)
+    return "in=%s out=%s reasoning=%s cached=%s" % tuple("-" if v is None else v for v in (a, b, c, d))
+
+
+def _usage_add(stat, u):
+    """Сумма usage по всем заходам одного стрима (повторы и продолжения тоже стоят токенов)."""
+    tot = stat.setdefault("tok", [None, None, None, None])
+    for i, v in enumerate(_usage_pick(u)):
+        if isinstance(v, (int, float)):
+            tot[i] = (tot[i] or 0) + int(v)
+
+
+def _stream_line(st, err=None, tag=""):
+    """Одна строка лога на стрим: время до первого токена, длительность, токены, заходы."""
+    f = lambda v: "-" if v is None else "%.1fs" % v
+    tok = st.get("tok") or [None] * 4
+    t = tuple("-" if v is None else v for v in tok)
+    return ("kimi: stream%s model=%s thinking=%s max_tokens=%s dt=%.1fs first_think=%s first_text=%s calls=%d "
+            "cont=%s finish=%s tokens in=%s out=%s reasoning=%s cached=%s%s") % (
+        "[%s]" % tag if tag else "", st.get("model"), st.get("thinking"), st.get("max_tokens"),
+        time.monotonic() - st["t0"], f(st.get("tth")), f(st.get("ttfb")), st.get("calls", 0),
+        st.get("cont", 0), st.get("finish"), t[0], t[1], t[2], t[3], (" err=%s" % err) if err else "")
+
+
+async def ask_stream(messages, model=None, deep=False, json_mode=False, images=None, thinking=False,
+                     max_tokens=None, tools=None, tool_exec=None, _attempt=0, tag=""):
+    """Стриминг ответа модели (подробности — в _ask_stream). Каждый стрим пишет в лог ОДНУ строку:
+    время до первого токена мышления и ответа, длительность, токены (вход/выход/мышление/из кэша —
+    суммой по всем заходам), число заходов и продолжений. Текст запросов и ответов в лог не попадает.
+    tag — метка этапа для лога (например «ec-errors»)."""
+    st = {"t0": time.monotonic(), "calls": 0, "cont": 0}
+    err = None
+    gen = _ask_stream(messages, model=model, deep=deep, json_mode=json_mode, images=images,
+                      thinking=thinking, max_tokens=max_tokens, tools=tools, tool_exec=tool_exec,
+                      _attempt=_attempt, _stat=st)
+    try:
+        async for ev, v in gen:
+            now = time.monotonic() - st["t0"]
+            if ev == "think" and st.get("tth") is None:
+                st["tth"] = now
+            elif ev == "text" and st.get("ttfb") is None:
+                st["ttfb"] = now
+            elif ev == "err":
+                err = v
+            yield ev, v
+    finally:
+        try:
+            await gen.aclose()                  # потребитель ушёл раньше конца — внутренний стрим закрываем сразу
+        except Exception:
+            pass
+        log.info(_stream_line(st, err, tag))
+
+
+async def _ask_stream(messages, model=None, deep=False, json_mode=False, images=None, thinking=False,
+                      max_tokens=None, tools=None, tool_exec=None, _attempt=0, _stat=None):
+    """Стриминг ответа модели: async-генератор пар (тип, дельта).
+
+    Типы: «think» — кусочек размышления (reasoning_content), «text» — кусочек ответа,
+    «tool» — маркер tool-захода (имена инструментов): его служебные «Поищу…» шли дельтами text,
+    но в финальный ответ не входят (потребитель сбрасывает накопленное по маркеру),
+    «err» — сбой («off» — нет ключа, «http» — API отказал, «net» — сеть/таймаут,
+    «empty» — модель не вернула ни одного кусочка ответа); после err генератор завершается.
+    Мысль идёт отдельными дельтами — её показывают «от имени Вишенки» («Вишенка думает…»).
+
+    tools/tool_exec — официальные инструменты Kimi (web_search/fetch, см. webtools.py): модель САМА
+    решает, когда искать в интернете; её tool_calls исполняются tool_exec и возвращаются в историю
+    сообщениями role=tool (до MAX_TOOL_ROUNDS заходов), дельты каждого захода идут теми же событиями.
+
+    Модель и режим НЕ МЕНЯЮТСЯ ни на одном шаге: повтор идёт строго с той же моделью
+    и тем же режимом, что и первый заход (требование: «выбрана K3 — работает K3»).
+
+    Если стрим оборвался без ответа (бюджет сгорел на размышлениях, обрыв соединения),
+    запрос повторяется один раз с тем же огромным бюджетом. МЫШЛЕНИЕ СТРИМИТСЯ ВСЕГДА —
+    и при повторе, и при продолжении (баг-репорт 016): раньше дельты мышления шли только
+    в первом заходе («чтобы не видеть дублей «Вишенка думает»»), и стрим мышления ЗАМИРАЛ
+    ровно в тяжёлых сценариях (тест в PDF: ответ огромный, бюджет часто сгорает на
+    размышлениях или обрезается) — модель продолжала думать, а пользователь видел
+    замерший «Вишенка думает» без единого нового символа. Дублей не видно и так:
+    фронт дописывает дельты в текущий шаг «думает» (index.html: chThink),
+    ThinkRelay — в те же сообщения, прелоадер «ИИ-проверки» — в тот же блок.
+
+    ОБРЕЗАННЫЙ ОТВЕТ НЕ ВЫДАЁТСЯ ЗА ПОЛНЫЙ (корень бага «в Word попало не всё»): если
+    после первого кусочка ответа поток оборвался (finish_reason=length — кончился бюджет,
+    обрыв соединения, обрыв SSE без [DONE]) — ответ ДОСОБИРАЕТСЯ продолжением (до MAX_CONT
+    заходов): обрезанный текст закрепляется репликой ассистента, модель продолжает ровно
+    с места обрыва (см. CONT_PROMPT). Дельты продолжения идут теми же «text»-кусочками."""
+    if not API_KEY:
+        yield "err", "off"
+        return
+    m = resolve_model(model, deep)
+    reasoning = bool(thinking) or m.startswith("kimi-k3")
+    if _stat is not None:
+        _stat["model"], _stat["thinking"] = m, reasoning
+    budget = budget_for(deep, reasoning, max_tokens)
+    if max_tokens is None:
+        budget = _clamp_to_known(m, budget)
+    run, acc, cont, cretry = list(messages), [], 0, 0    # run — диалог с закреплёнными продолжениями
+    attempt, drops, tool_rounds = 0, 0, 0
+    tools_now, tool_acc = tools, []          # tools_now — снимается после лимита; tool_acc — «Поищу…» (не финал)
+    while True:
+        body = build_payload(run, model=m, deep=deep, json_mode=json_mode, images=images,
+                             thinking=thinking, max_tokens=budget, tools=tools_now)
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}    # usage в конце стрима — видно, сгорел ли бюджет
+        if _stat is not None:
+            _stat["calls"] += 1
+            _stat["max_tokens"] = body.get("max_tokens")
+        finish, usage, got_text, broke, done = None, None, False, False, False
+        buf = []                            # текст этого захода — для закрепления в продолжении
+        tc_acc = {}                         # накопитель tool_calls этого захода (см. _tc_add)
+        try:
+            async with aiohttp.ClientSession(timeout=stream_timeout()) as s:
+                async with s.post(BASE + "/chat/completions", json=body,
+                                  headers={"Authorization": "Bearer " + API_KEY}) as r:
+                    if r.status != 200:
+                        raw = await r.text()
+                        log.warning("kimi: HTTP %s: %s", r.status, raw[:300])
+                        if r.status == 400 and "max_tokens" in raw:
+                            nb = _smaller_budget(m, budget, raw)
+                            if nb is not None and drops < 6:   # защита от бесконечного пересогласования
+                                drops += 1
+                                budget = nb
+                                continue          # повтор с бюджетом, который API примет
+                        yield "err", "http"
+                        return
+                    async for line in r.content:
+                        s_line = line.decode("utf-8", "replace").strip()
+                        if not s_line.startswith("data:"):
+                            continue
+                        data = s_line[5:].strip()
+                        if data == "[DONE]":
+                            done = True
+                            continue
+                        if not data:
+                            continue
+                        try:
+                            j = json.loads(data)
+                        except ValueError:
+                            continue
+                        if j.get("usage"):
+                            usage = j["usage"]
+                        ch = (j.get("choices") or [{}])[0]
+                        if ch.get("finish_reason"):
+                            finish = ch["finish_reason"]
+                        d = ch.get("delta") or {}
+                        th, tx = d.get("reasoning_content"), d.get("content")
+                        if th:
+                            yield "think", th      # мышление показывается в любом заходе (см. докстринг)
+                        if tx:
+                            got_text = True
+                            buf.append(tx)
+                            yield "text", tx
+                        tcs = d.get("tool_calls")
+                        if isinstance(tcs, list):
+                            _tc_add(tc_acc, tcs)
+        except Exception as e:                    # сеть, таймаут, кривой SSE — всё мимо бота
+            log.warning("kimi: стрим не прошёл: %r", e)
+            broke = True
+        if _stat is not None:
+            _stat["finish"], _stat["cont"] = finish, cont
+            _usage_add(_stat, usage)
+        calls = _tc_list(tc_acc)            # модель запросила инструменты (web_search/fetch)
+        if calls and not broke and tool_exec is not None and tool_rounds < MAX_TOOL_ROUNDS:
+            if got_text:
+                tool_acc.append("".join(buf))    # «Поищу…» — остаётся в истории, но НЕ в финальном ответе
+            run += [{"role": "assistant", "content": "".join(buf), "tool_calls": calls}]
+            run += await _tool_results(calls, tool_exec)
+            tool_rounds += 1
+            if tool_rounds >= MAX_TOOL_ROUNDS:
+                # лимит исчерпан: инструменты убираются — модель обязана досказать финал по полученным данным
+                tools_now = None
+                run += [{"role": "user", "content": TOOL_FINAL_PROMPT}]
+                log.info("kimi: лимит tool-заходов (%d) — прошу финальный ответ по полученным данным",
+                         MAX_TOOL_ROUNDS)
+            else:
+                log.info("kimi: tool_calls %s — исполняю (заход %d/%d)",
+                         [c["function"]["name"] for c in calls], tool_rounds, MAX_TOOL_ROUNDS)
+            yield "tool", ", ".join(c["function"]["name"] for c in calls)   # маркер: «Поищу…» — служебный текст
+            continue                        # новый заход с результатами инструментов в истории
+        if calls:
+            log.warning("kimi: tool_calls без исполнителя (broke=%s exec_ok=%s rounds=%s/%s calls=%s) — "
+                        "отдаю текст как есть",
+                        broke, tool_exec is not None, tool_rounds, MAX_TOOL_ROUNDS,
+                        [c["function"]["name"] for c in calls])
+        cut = broke or finish == "length" or (got_text and not done and finish is None)
+        if got_text:
+            acc += buf
+            _remember(m, budget)
+            if cut and cont < MAX_CONT:     # обрезанный ответ — дособираем продолжением
+                log.warning("kimi: ответ обрезан (finish=%s broke=%s, %s символов) — продолжаю (заход %s)",
+                            finish, broke, sum(len(x) for x in acc), cont + 1)
+                run = _continue_run(run, "".join(acc))
+                cont += 1
+                cretry = 0
+                continue
+            if cut:
+                log.warning("kimi: ответ обрезан и продолжения исчерпаны — отдаю как есть (%s символов)",
+                            sum(len(x) for x in acc))
+            return
+        if acc:                             # продолжение не дало текста — один повтор, затем отдаём что есть
+            log.warning("kimi: продолжение без текста (finish=%s broke=%s) — отдаю %s символов как есть",
+                        finish, broke, sum(len(x) for x in acc))
+            if cretry == 0:
+                cretry += 1
+                continue
+            return
+        # стрим дошёл до конца без единой дельты ответа: почти всегда бюджет max_tokens
+        # сгорел на размышлениях (finish_reason=length) либо соединение оборвалось
+        log.warning("kimi: стрим без ответа (finish=%s usage=%s max_tokens=%s broke=%s)",
+                    finish, usage, body.get("max_tokens"), broke)
+        if attempt == 0:
+            attempt += 1
+            continue                            # повтор строго той же моделью и режимом
+        if tool_acc:
+            # инструменты отработали, а финального текста так и не дали — отдаём собранный ход работы
+            yield "text", "".join(tool_acc).strip()
+            return
+        yield "err", ("net" if broke else "empty")
+        return
+
+
+async def balance():
+    """Баланс аккаунта Moonshot/Kimi (dict с available_balance/voucher_balance/cash_balance) или None.
+
+    Деньги считаются в юанях (CNY) — как в личном кабинете platform.kimi.ai.
+    Использует тот же KIMI_API_KEY, что и все запросы модели."""
+    if not API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession(timeout=request_timeout(TIMEOUT)) as s:
+            async with s.get(BASE + "/users/me/balance",
+                             headers={"Authorization": "Bearer " + API_KEY}) as r:
+                raw = await r.text()
+                if r.status != 200:
+                    log.warning("kimi: balance HTTP %s: %s", r.status, raw[:300])
+                    return None
+        j = json.loads(raw)
+        d = j.get("data") if isinstance(j, dict) else None
+        return d if isinstance(d, dict) else None
+    except Exception as e:
+        log.warning("kimi: баланс не получился: %r", e)
+        return None
+
+
+async def ask_json(messages, **kw):
+    """Ответ как dict (модель отвечает строгим JSON) или None. Просит JSON через response_format
+    и дополнительно проверяет разбор — кривой JSON не должен ронять конвейер."""
+    raw = await ask(messages, json_mode=True, **kw)
+    if raw is None:
+        return None
+    try:
+        j = json.loads(raw)
+    except ValueError:
+        log.warning("kimi: ответ не разобрался как JSON: %s", raw[:300])
+        return None
+    return j if isinstance(j, dict) else None
