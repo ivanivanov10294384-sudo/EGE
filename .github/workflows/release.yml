@@ -38,7 +38,8 @@ jobs:
             exit 0
           fi
           # файл прикрепляется к самому релизу — его можно скачать со страницы релиза
-          gh release upload "$TAG" "$APK" --clobber
+          # ($TAG из предыдущего шага здесь не видна — берём стандартную GITHUB_REF_NAME)
+          gh release upload "$GITHUB_REF_NAME" "$APK" --clobber
           # роллинг-релиз «apk-latest»: адрес из мини-аппа не меняется, CI перезаливает туда файл
           if gh release view apk-latest >/dev/null 2>&1; then
             gh release upload apk-latest "$APK" --clobber
