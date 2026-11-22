@@ -23,7 +23,7 @@ jobs:
 
       - name: Обновить релиз apk-latest
         env:
-          GH_TOKEN: *** secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           APK="APK mobile app/kabinet-repetitora.apk"
           if [ ! -f "$APK" ]; then
