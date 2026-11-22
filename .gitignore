@@ -15,6 +15,10 @@ venv/
 *.aab
 *.ap_
 *.dex
+# ...но готовая сборка мобильного приложения — часть проекта, её коммитим
+# (без этого /apk не мог отдать файл ни на одном чистом деплое — файл просто не попадал в git)
+!APK mobile app/*.apk
+!Telegram Mini App/docs/*.apk
 .gradle/
 build/
 local.properties

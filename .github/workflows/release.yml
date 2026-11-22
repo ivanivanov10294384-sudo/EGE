@@ -27,3 +27,23 @@ jobs:
             --title "$TAG" \
             --notes-file "$FILE" \
             --verify-tag
+
+      - name: Attach APK and refresh apk-latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APK="APK mobile app/kabinet-repetitora.apk"
+          if [ ! -f "$APK" ]; then
+            echo "APK не найден ($APK) — пропускаю: кнопка скачивания уйдёт на /apk без файла"
+            exit 0
+          fi
+          # файл прикрепляется к самому релизу — его можно скачать со страницы релиза
+          gh release upload "$TAG" "$APK" --clobber
+          # роллинг-релиз «apk-latest»: адрес из мини-аппа не меняется, CI перезаливает туда файл
+          if gh release view apk-latest >/dev/null 2>&1; then
+            gh release upload apk-latest "$APK" --clobber
+          else
+            gh release create apk-latest "$APK" \
+              --title "Последняя сборка APK" \
+              --notes "Роллинг-релиз: CI при каждой сборке перезаливает сюда актуальный kabinet-repetitora.apk. Мини-апп скачивает приложение именно по этой ссылке."
+          fi

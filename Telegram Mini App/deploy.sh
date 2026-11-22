@@ -47,6 +47,14 @@ fi
 echo "==> Обновление кода"
 git pull --ff-only
 
+echo "==> APK в сборку"
+# Dockerfile копирует только «Telegram Mini App/» (контекст сборки) — соседняя папка
+# «APK mobile app/» в образ не попадает. Кладём APK в docs/, чтобы /apk отдавал файл из образа.
+for f in "../APK mobile app/"*.apk; do
+  [ -f "$f" ] || continue
+  cp -f "$f" docs/ && echo "    $(basename "$f") → docs/"
+done
+
 echo "==> Сборка и запуск"
 docker compose up -d --build
 

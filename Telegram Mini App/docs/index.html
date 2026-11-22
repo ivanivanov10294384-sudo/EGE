@@ -4963,12 +4963,13 @@ function chPrefetch(){try{(CH||[]).forEach((c,i)=>{(((c&&c.a)||[]).forEach((x,j)
   if(!x||!x.u||!chIsDoc(x))return;if(x._rf&&Date.now()-x._rf<60000)return;x._rf=Date.now();
   chRefresh(i,j).catch(()=>{})}))})}catch(e){}}
 function chDl(i,j){chOpen(i,j)}   // кнопка «Скачать» — ровно тот же путь, что и тап по файлу/стикеру
-/* УНИВЕРСАЛЬНАЯ ссылка на САМУЮ ПОСЛЕДНЮЮ сборку APK:
-   GitHub-релиз «apk-latest» — CI при каждой сборке ПЕРЕЗАЛИВАЕТ туда файлы, поэтому адрес
-   не меняется и всегда ведёт на свежую версию. Номер версии в ссылку не зашит. */
-const APK_URL="https://github.com/vladimirgladik1996-commits/Shkola_EGE/releases/download/apk-latest/kabinet-repetitora-prod.apk";
+/* Запасная ссылка на APK: релиз «apk-latest» ЭТОГО репозитория — CI перезаливает туда файл при
+   каждой сборке (см. .github/workflows/release.yml), поэтому адрес не меняется и всегда свежий.
+   Раньше здесь была ссылка на чужой репозиторий, который уже удалён, — кнопка вела в 404. */
+const APK_URL="https://github.com/ivanivanov10294384-sudo/EGE/releases/download/apk-latest/kabinet-repetitora.apk";
 /* «Скачать мобильное приложение» (нижний пункт меню): тап → скачивается последняя версия мобильного приложения.
-   Универсальная ссылка APK_URL — основная; /apk (тот же файл от кабинета) — запасной вариант. */
+   Основной путь — /apk с того же адреса, что и кабинет: сервер отдаёт файл сам или перенаправляет на релиз.
+   APK_URL — аварийный запас на случай сбоя моста/навигации. */
 function apkDl(){const A=window.Android||{},go=u=>{
     try{
       if(A.openFile){A.openFile(u,"kabinet-repetitora.apk","application/vnd.android.package-archive");return}   // APK: скачать и открыть установщик
@@ -4976,9 +4977,9 @@ function apkDl(){const A=window.Android||{},go=u=>{
       if(tg&&tg.openLink){tg.openLink(u);return}   // Telegram: система скачивает файл
       if(tg&&tg.downloadFile){tg.downloadFile({url:u,file_name:"kabinet-repetitora.apk",mime_type:"application/vnd.android.package-archive"});return}
       const a=document.createElement("a");a.href=u;a.download="kabinet-repetitora.apk";a.rel="noopener";document.body.appendChild(a);a.click();a.remove()   // браузер: обычное скачивание
-    }catch(e){location.href=u}};
+    }catch(e){if(u!==APK_URL)location.href=APK_URL;else location.href=u}};
   setNav(false);
-  go(APK_URL)}   // всегда самая последняя версия (см. APK_URL)
+  go((API_BASE||location.origin)+"/apk")}   // файл у кабинета или редирект на релиз — одним адресом
 let chShBusy=false;
 /* «Поделиться» — ПЕРЕСЫЛКА САМОГО ФАЙЛА, ссылки запрещены полностью:
    APK — системное окно «Переслать файл» (ACTION_SEND с файлом);

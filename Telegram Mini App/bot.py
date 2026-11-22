@@ -2895,13 +2895,45 @@ async def cors_mw(request, handler):
     return resp
 
 
+# APK мобильного приложения: свой файл — первым; нет его в этом деплое — уводим на релиз GitHub
+# (адрес меняется переменной APK_FALLBACK_URL; пустая строка — не уводить, вернуть честный 404).
+APK_NAME = "kabinet-repetitora.apk"
+APK_FALLBACK = os.getenv("APK_FALLBACK_URL",
+                         "https://github.com/ivanivanov10294384-sudo/EGE/releases/download/apk-latest/"
+                         + APK_NAME).strip()
+
+
+def _apk_file():
+    """Где лежит APK для раздачи: явный путь APK_FILE → docs/ (попадает в Docker-образ вместе
+    с кодом; deploy.sh кладёт файл сюда перед сборкой) → «APK mobile app/» (каноническое место
+    в репозитории, см. README). Файл коммитится в git — раньше его блокировал *.apk в .gitignore,
+    из-за чего /apk отдавал ошибку на каждом чистом деплое."""
+    for p in (os.getenv("APK_FILE", "").strip(),
+              os.path.join(HERE, "docs", APK_NAME),
+              os.path.join(HERE, "..", "APK mobile app", APK_NAME)):
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
 async def api_apk(_request):
     """APK приложения для скачивания — отдаётся с того же адреса, что и кабинет.
 
-    Файл лежит в docs/ (его кладёт и обновляет CI рядом со сборкой),
-    поэтому ссылка всегда ведёт на актуальную версию."""
-    return web.FileResponse(os.path.join(HERE, "..", "APK mobile app", "kabinet-repetitora.apk"),
-                            headers={"Content-Disposition": 'attachment; filename="kabinet-repetitora.apk"'})
+    Файл ищем в docs/ и в «APK mobile app/» (см. _apk_file). Нет файла в этом деплое —
+    302 на релиз apk-latest: кнопка «Скачать мобильное приложение» продолжает работать.
+    Совсем нечего отдать — 404 с подсказкой, а не падение в 500."""
+    path = _apk_file()
+    if path is None:
+        if APK_FALLBACK:
+            raise web.HTTPFound(APK_FALLBACK)   # скачивание продолжится с релиза GitHub
+        return web.json_response(
+            {"ok": False, "error": "apk_missing",
+             "detail": f"Файл {APK_NAME} не найден: положите его в «APK mobile app/» или "
+                       "«Telegram Mini App/docs/» (либо задайте APK_FILE / APK_FALLBACK_URL)"},
+            status=404)
+    return web.FileResponse(path, headers={
+        "Content-Disposition": f'attachment; filename="{APK_NAME}"',
+        "Content-Type": "application/vnd.android.package-archive"})
 
 
 # ---------- «ИИ-проверка»: сеансы проверки (пуш 4 из PUSH-PLAN.md) ----------

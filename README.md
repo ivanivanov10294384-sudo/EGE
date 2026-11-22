@@ -85,6 +85,8 @@ docker run -p 8080:8080 --env-file .env tutor-bot
 | `API_RATE_PER_MIN` | лимит API-запросов (по умолчанию 120/мин) |
 | `YANDEX_SA_KEY` / `YANDEX_SA_KEY_FILE` | ключ сервисного аккаунта Яндекс Облака (биллинг) |
 | `ESSAY_REPORT_ENGINE` | движок отчёта (`html` и др.) |
+| `APK_FILE` | явный путь к APK для скачивания (иначе ищется в `docs/` и `APK mobile app/`) |
+| `APK_FALLBACK_URL` | куда перенаправлять `/apk`, если файла нет в деплое (пусто — отключить, по умолчанию релиз `apk-latest` репозитория) |
 | `LOG_LEVEL` | уровень логирования |
 
 ## HTTP API (кратко)
@@ -103,5 +105,12 @@ docker run -p 8080:8080 --env-file .env tutor-bot
 
 ## Примечание
 
-Маршрут `/apk` в `bot.py` указывает на `../APK mobile app/kabinet-repetitora.apk` —
-файл вынесен в отдельную папку при организации репозитория.
+Маршрут `/apk` в `bot.py` ищет `kabinet-repetitora.apk` по порядку: `APK_FILE` →
+`Telegram Mini App/docs/` → `../APK mobile app/` (каноническое место в репозитории).
+Нет файла в деплое — `/apk` перенаправляет на релиз `apk-latest` репозитория
+(`.github/workflows/release.yml` перезаливает туда файл при каждом релизе).
+
+**Важно про APK:** файл коммитится в git (`.gitignore` делает исключение для
+`APK mobile app/*.apk`). Если сборки в папке нет — скачивание работать не будет:
+положите `kabinet-repetitora.apk` в `APK mobile app/` и закоммитьте. Для Docker-сборки
+`deploy.sh` копирует APK в `Telegram Mini App/docs/` — так файл попадает в образ.
