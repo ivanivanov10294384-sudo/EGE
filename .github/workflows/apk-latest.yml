@@ -1,0 +1,41 @@
+name: APK latest
+
+# Автопубликация APK: при каждом изменении файла сборки (или вручную) CI перезаливает
+# его в роллинг-релиз «apk-latest» — постоянный адрес, по которому мини-апп скачивает
+# приложение (см. APK_FALLBACK_URL в bot.py). Номер версии в адрес не зашит.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "APK mobile app/**"
+      - "Telegram Mini App/docs/*.apk"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Обновить релиз apk-latest
+        env:
+          GH_TOKEN: *** secrets.GITHUB_TOKEN }}
+        run: |
+          APK="APK mobile app/kabinet-repetitora.apk"
+          if [ ! -f "$APK" ]; then
+            echo "APK не найден ($APK) — заливать нечего"
+            exit 0
+          fi
+          if gh release view apk-latest >/dev/null 2>&1; then
+            gh release upload apk-latest "$APK" --clobber
+            echo "релиз apk-latest обновлён"
+          else
+            gh release create apk-latest "$APK" \
+              --title "Последняя сборка APK" \
+              --notes "Роллинг-релиз: CI перезаливает сюда актуальный kabinet-repetitora.apk при каждом изменении файла. Мини-апп «Кабинет» скачивает мобильное приложение именно по этой ссылке."
+            echo "релиз apk-latest создан"
+          fi

@@ -21,6 +21,7 @@
 │   ├── knowledge/         # база знаний
 │   ├── assets/, fonts/    # статика: логотипы, шрифты, CSS/JS отчётов
 │   ├── Dockerfile         # сборка образа
+│   ├── docker-compose.yml # запуск через docker compose (использует deploy.sh)
 │   ├── deploy.sh          # скрипт деплоя
 │   └── requirements.txt   # зависимости Python
 └── APK mobile app/        # Android-приложение «Кабинет репетитора»
@@ -108,9 +109,16 @@ docker run -p 8080:8080 --env-file .env tutor-bot
 Маршрут `/apk` в `bot.py` ищет `kabinet-repetitora.apk` по порядку: `APK_FILE` →
 `Telegram Mini App/docs/` → `../APK mobile app/` (каноническое место в репозитории).
 Нет файла в деплое — `/apk` перенаправляет на релиз `apk-latest` репозитория
-(`.github/workflows/release.yml` перезаливает туда файл при каждом релизе).
+(`.github/workflows/release.yml` перезаливает туда файл при каждом релизе,
+`.github/workflows/apk-latest.yml` — при каждом изменении файла на main).
 
-**Важно про APK:** файл коммитится в git (`.gitignore` делает исключение для
-`APK mobile app/*.apk`). Если сборки в папке нет — скачивание работать не будет:
-положите `kabinet-repetitora.apk` в `APK mobile app/` и закоммитьте. Для Docker-сборки
-`deploy.sh` копирует APK в `Telegram Mini App/docs/` — так файл попадает в образ.
+**Важно про APK:** файл коммитится в git в двух местах — `APK mobile app/` (каноническое
+хранение) и `Telegram Mini App/docs/` (копия внутри Docker-контекста: так файл попадает
+в образ на Render/Docker без лишних шагов). git хранит обе копии одним объектом —
+без раздувания истории. Обновляя сборку, кладите файл в обе папки (или в `APK mobile app/`
+и выполните `cp 'APK mobile app/kabinet-repetitora.apk' 'Telegram Mini App/docs/'`) —
+CI проверяет, что копии идентичны. Релизный workflow прикрепляет APK к релизам
+и поддерживает роллинг-релиз `apk-latest`.
+
+**Деплой:** Render (прод) собирает образ из `Telegram Mini App/` этого репозитория
+и обновляется автоматически при пуше в `main`; VPS — `sh deploy.sh` (docker compose).

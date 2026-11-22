@@ -1,0 +1,50 @@
+name: CI
+
+# Проверки на каждый пуш и PR: код собирается, APK на месте и валиден.
+# Сборка самого APK здесь невозможна — в репозитории нет исходников Android-проекта,
+# хранится готовая сборка (см. «APK mobile app/README.md»); CI проверяет её контракт.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python — синтаксис
+        run: python -m py_compile "Telegram Mini App/"*.py
+
+      - name: deploy.sh и docker-compose — синтаксис
+        run: |
+          sh -n "Telegram Mini App/deploy.sh"
+          python -c "import yaml; yaml.safe_load(open('Telegram Mini App/docker-compose.yml'))"
+
+      - name: APK — контракт сборки
+        run: |
+          python - <<'PY'
+          import hashlib, sys, zipfile
+          paths = ["APK mobile app/kabinet-repetitora.apk",
+                   "Telegram Mini App/docs/kabinet-repetitora.apk"]
+          digests = []
+          for p in paths:
+              raw = open(p, "rb").read()
+              z = zipfile.ZipFile(p)
+              names = z.namelist()
+              assert z.testzip() is None, f"{p}: битый zip"
+              assert "AndroidManifest.xml" in names, f"{p}: нет AndroidManifest.xml"
+              assert any(n.startswith("classes") and n.endswith(".dex") for n in names), f"{p}: нет classes.dex"
+              digests.append(hashlib.sha256(raw).hexdigest())
+              print(f"APK OK: {p} — {len(raw)} байт, sha256 {digests[-1][:16]}…")
+          assert digests[0] == digests[1], "копии APK в «APK mobile app/» и docs/ расходятся"
+          print("копии идентичны")
+          PY
+
+      - name: release.yml — синтаксис
+        run: python -c "import yaml; [yaml.safe_load(open(f)) for f in ['.github/workflows/release.yml', '.github/workflows/apk-latest.yml']]; print('workflow OK')"

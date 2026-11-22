@@ -1,0 +1,18 @@
+# Локальный/VPS-деплой бэкенда «Кабинета репетитора».
+# Запуск: sh deploy.sh (или docker compose up -d --build).
+# APP_UID/APP_GID передаёт deploy.sh — контейнер работает от пользователя-владельца ./data.
+services:
+  tutor-bot:
+    build:
+      context: .
+      args:
+        APP_UID: "${APP_UID:-1000}"
+        APP_GID: "${APP_GID:-1000}"
+    image: tutor-bot
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

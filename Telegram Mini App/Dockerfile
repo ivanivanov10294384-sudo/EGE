@@ -22,8 +22,10 @@ RUN mkdir -p assets/fonts && (python -c "import urllib.request as u;u.urlretriev
 COPY . .
 
 # не root: UID/GID задаются из docker-compose (см. APP_UID/APP_GID в deploy.sh), чтобы писать в ./data
-RUN mkdir -p /app/data && chown 1000:1000 /app/data   # владелец = USER ниже: без этого sqlite не создаст tutor.db
-USER 1000:1000
+ARG APP_UID=1000
+ARG APP_GID=1000
+RUN mkdir -p /app/data && chown $APP_UID:$APP_GID /app/data   # владелец = USER ниже: без этого sqlite не создаст tutor.db
+USER $APP_UID:$APP_GID
 
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
