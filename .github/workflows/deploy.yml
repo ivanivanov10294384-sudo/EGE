@@ -1,0 +1,44 @@
+name: Deploy
+
+# Автодеплой на Render при пуше в main (сервис tutor-bot, строго из этого репозитория).
+# Работает, когда в секретах репозитория задан RENDER_API_KEY (ключ Render API с правами
+# на управление сервисом). Без секрета деплой аккуратно пропускается — падений нет.
+# Альтернатива без секретов: нативный автодеплой Render через установку Render GitHub App
+# на репозиторий — тогда этот workflow избыточен.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверить секрет RENDER_API_KEY
+        id: check
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          if [ -n "$RENDER_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "RENDER_API_KEY не задан — деплой пропущен."
+            echo "Задать: Settings → Secrets and variables → Actions → New repository secret → RENDER_API_KEY."
+          fi
+
+      - name: Запустить деплой tutor-bot на Render
+        if: steps.check.outputs.present == 'true'
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          curl -sf -X POST \
+            --oauth2-bearer "$RENDER_API_KEY" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" -d '{}' \
+            "https://api.render.com/v1/services/srv-db6eg0ajnfac73dfqv5g/deploys" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin).get('deploy',{}); print('деплой запущен:', d.get('id'), '|', d.get('status'))"

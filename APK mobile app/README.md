@@ -19,6 +19,7 @@ Android-приложение для репетиторов, работающих
 | Название | Кабинет репетитора |
 | Пакет | `ru.kabinet.tutor` (dev-сборка: `ru.kabinet.tutor.dev`) |
 | Deep link | `kabinet://` (dev: `kabinet-dev://`) |
+| SHA256 | `7a83273fa6d612e859a85f154d3ee01236a2170d043a259d70f2c10a53db4ba2` |
 | Доступен для скачивания | `https://<ваш-хост>/apk` (маршрут `api_apk` в `Telegram Mini App/bot.py`) |
 
 Маршрут `/apk` ищет файл по порядку: переменная `APK_FILE` → `Telegram Mini App/docs/kabinet-repetitora.apk`
